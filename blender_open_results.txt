@@ -1,0 +1,9 @@
+Info: Select at least two edge loops
+LINEAR 0 0 SMOOTH vertex_error 0.0 face_counts 24 24
+PATH 1 0 SMOOTH vertex_error 1e-06 face_counts 24 24
+SURFACE 1 0 SMOOTH vertex_error 0.0 face_counts 24 24
+LINEAR 0 0.5 SMOOTH vertex_error 0.0 face_counts 24 24
+LINEAR 0 -0.5 SMOOTH vertex_error 0.0 face_counts 24 24
+LINEAR 0 0.5 SPHERE vertex_error 0.0 face_counts 24 24
+LINEAR 0 0.5 SHARP vertex_error 0.0 face_counts 24 24
+OPEN CASES 168 FAILURES 0
