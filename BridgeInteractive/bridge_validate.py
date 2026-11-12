@@ -1,66 +1,131 @@
-"""Validation of affected bridge polygons, independent of Cinema 4D."""
+# -*- coding: utf-8 -*-
+"""Проверка результата операции до записи в объект.
+
+Валидатор намеренно не ищет глобальные самопересечения всей сетки: это
+дорого и на реальных моделях даёт ложные срабатывания. Проверяются локальные
+свойства затронутых полигонов плюс общая манифолдность рёбер.
+"""
 from collections import defaultdict
-from math import isfinite
-try:
-    from bridge_interactive_core import face_vertices,key,sub,cross,dot
-except ImportError:
-    from bridge_core import face_vertices,key,sub,cross,dot
 
-def canonical(face):
-    """Ignore starting corner and orientation when detecting identical polygons."""
-    f=tuple(face);r=tuple(reversed(f))
-    return min(*(f[i:]+f[:i] for i in range(len(f))),*(r[i:]+r[:i] for i in range(len(r))))
+from bridge_math import EPS, sub, dot, cross, length, edge_key, edges_of
 
-def edges_cross(a,b,c,d,scale):
-    """Detect a proper 3D intersection of two non-adjacent segments."""
-    u=sub(b,a);v=sub(d,c);w=sub(a,c)
-    uu=dot(u,u);uv=dot(u,v);vv=dot(v,v);uw=dot(u,w);vw=dot(v,w)
-    den=uu*vv-uv*uv
-    if den<=uu*vv*1e-20:return False
-    s=(uv*vw-vv*uw)/den;t=(uu*vw-uv*uw)/den
-    if not (1e-10<s<1-1e-10 and 1e-10<t<1-1e-10):return False
-    diff=tuple(w[k]+s*u[k]-t*v[k] for k in range(3))
-    return dot(diff,diff)<=scale*1e-20
 
-def validate_result(points,faces,affected):
-    """Reject unsafe results involving newly created or merge-modified polygons.
+class ValidationError(ValueError):
+    pass
 
-    Unrelated pre-existing defects are not rejected. This validates local topology
-    and zero-area faces, not global mesh self-intersection or Blender parity.
+
+def check_plan(plan):
+    """Бросает ValidationError, если результат нельзя записывать в объект."""
+    points, faces = plan.points, plan.faces
+    if not faces:
+        raise ValidationError('Операция удалила бы все полигоны объекта.')
+    n = len(points)
+    for face in faces:
+        if len(face) not in (3, 4):
+            raise ValidationError('В результат попал полигон с %d вершинами.' % len(face))
+        if len(set(face)) != len(face):
+            raise ValidationError('Полигон с повторяющейся вершиной: результат отменён.')
+        for v in face:
+            if not isinstance(v, int) or v < 0 or v >= n:
+                raise ValidationError('Полигон ссылается на несуществующую вершину.')
+
+    counts = defaultdict(int)
+    for face in faces:
+        for a, b in edges_of(list(face), True):
+            counts[edge_key(a, b)] += 1
+    non_manifold = sum(1 for v in counts.values() if v > 2)
+    if non_manifold:
+        raise ValidationError(
+            'Результат содержал бы %d рёбер с тремя и более полигонами. '
+            'Такая сетка неманифолдна, поэтому операция отменена.' % non_manifold)
+
+    # Дубликаты ищем только среди новых: у исходной модели могут быть свои
+    # особенности, которые инструмент не обязан исправлять.
+    seen = {}
+    for index in plan.new_faces:
+        key = _canonical(faces[index])
+        if key in seen:
+            raise ValidationError('Мост создаёт дублирующийся полигон '
+                                  '(совпадает с %d).' % seen[key])
+        seen[key] = index
+
+    degenerate = [index for index in plan.new_faces
+                  if _is_degenerate([points[v] for v in faces[index]])]
+    if degenerate:
+        raise ValidationError(
+            'Мост создаёт вырожденные полигоны нулевой площади (%d шт.). '
+            'Измените число разрезов, сдвиг или положение слияния.' % len(degenerate))
+
+    flipped = _flipped_new_faces(plan)
+    if flipped:
+        raise ValidationError(
+            'Мост создаёт полигоны с направлением, противоположным соседним (%d шт.). '
+            'Обычно это значит, что направления граней вдоль контура несогласованы.'
+            % len(flipped))
+    return True
+
+
+def _canonical(face):
+    f = tuple(face)
+    r = tuple(reversed(f))
+    variants = [f[i:] + f[:i] for i in range(len(f))] + [r[i:] + r[:i] for i in range(len(r))]
+    return min(variants)
+
+
+def _is_degenerate(vertices, relative=1e-9):
+    """Полигон вырожден, если у него нет площади при заметном размере.
+
+    Абсолютный порог бесполезен: модели бывают и в миллиметрах, и в
+    километрах. Поэтому площадь сравнивается с квадратом самого длинного ребра.
     """
-    affected=set(affected)
-    if any(not isinstance(i,int) or i<0 or i>=len(faces) for i in affected):
-        raise ValueError('Некорректные индексы полигонов моста.')
-    incidence=defaultdict(list);polygons=defaultdict(list)
-    for index,raw in enumerate(faces):
-        f=face_vertices(raw)
-        if any(not isinstance(v,int) or v<0 or v>=len(points) for v in f):
-            raise ValueError('Некорректный индекс вершины полигона.')
-        polygons[canonical(f)].append(index)
-        for a,b in zip(f,f[1:]+f[:1]):incidence[key(a,b)].append((index,a,b))
-        if index not in affected:continue
-        vertices=[points[v] for v in f]
-        if any(len(p)!=3 or not all(isfinite(x) for x in p) for p in vertices):
-            raise ValueError('Некорректные координаты полигона моста.')
-        edges=[sub(q,p) for p,q in zip(vertices,vertices[1:]+vertices[:1])]
-        lengths=[dot(e,e) for e in edges];scale=max(lengths)
-        if scale==0 or min(lengths)<=scale*1e-20:
-            raise ValueError('Мост создаёт ребро нулевой длины. Измените соответствие вершин или настройки.')
-        # Nonzero cross product in at least one triangle of either diagonal.
-        origin=vertices[0]
-        area=max(dot(cross(sub(vertices[i],origin),sub(vertices[j],origin)),
-                     cross(sub(vertices[i],origin),sub(vertices[j],origin)))
-                 for i in range(1,len(vertices)) for j in range(i+1,len(vertices)))
-        if area<=scale*scale*1e-24:
-            raise ValueError('Мост создаёт полигон нулевой площади. Измените соответствие или настройки.')
-        if len(vertices)==4 and (edges_cross(*vertices,scale) or
-                                 edges_cross(vertices[1],vertices[2],vertices[3],vertices[0],scale)):
-            raise ValueError('Мост создаёт самопересекающийся полигон. Измените соответствие вершин.')
-    for ids in polygons.values():
-        if len(ids)>1 and affected.intersection(ids):
-            raise ValueError('Мост создаёт дублирующийся полигон.')
-    for entries in incidence.values():
-        if not any(i in affected for i,_,_ in entries):continue
-        if len(entries)>2:raise ValueError('Мост создаёт неманифолдное ребро.')
-        if len(entries)==2 and entries[0][1:]==entries[1][1:]:
-            raise ValueError('Несогласованное направление полигонов у моста.')
+    longest = 0.0
+    shortest = float('inf')
+    for a, b in zip(vertices, vertices[1:] + vertices[:1]):
+        d = length(sub(b, a))
+        longest = max(longest, d)
+        shortest = min(shortest, d)
+    if longest <= EPS:
+        return True
+    if shortest <= longest * relative:
+        return True
+    origin = vertices[0]
+    area2 = 0.0
+    for i in range(1, len(vertices) - 1):
+        area2 = max(area2, length(cross(sub(vertices[i], origin),
+                                        sub(vertices[i + 1], origin))))
+    return area2 <= longest * longest * relative
+
+
+def _flipped_new_faces(plan):
+    """Новые грани, чьё ребро идёт в ту же сторону, что и у сохранённого соседа.
+
+    Для согласованной сетки два полигона на общем ребре обходят его в
+    противоположных направлениях. Совпадение направления означает вывернутую
+    грань.
+
+    plan.retained хранит СТАРЫЕ индексы, а в новом списке уцелевшие полигоны
+    идут первыми в том же порядке, поэтому их новые индексы — 0..N-1.
+    """
+    directed = {}
+    for index in range(len(plan.retained)):
+        face = plan.faces[index]
+        for a, b in edges_of(list(face), True):
+            directed[edge_key(a, b)] = (a, b, index)
+    bad = []
+    for index in plan.new_faces:
+        face = plan.faces[index]
+        for a, b in edges_of(list(face), True):
+            entry = directed.get(edge_key(a, b))
+            if entry is None:
+                continue
+            if (entry[0], entry[1]) == (a, b):
+                bad.append(index)
+                break
+    return bad
+
+
+def summarize(plan):
+    return ('режим=%(mode)s полигонов+%(nf)d точек+%(np)d удалено=%(rm)d'
+            % {'mode': plan.mode, 'nf': len(plan.new_faces),
+               'np': len(plan.points) - plan.old_point_count,
+               'rm': len(plan.removed_faces)})
